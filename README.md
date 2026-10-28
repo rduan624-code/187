@@ -1,75 +1,63 @@
-# RFAM-187 在线升级软件框架
+# RFAM-187 在线升级框架：按步骤阅读版
 
-基于用户提供的 SDK 源码，A 板 MicroBlaze 接收 MLC UDP 升级报文，统一管理 A/B/C/D 四个目标。当前交付协议层、状态机、lwIP 接入和硬件后端接口；**本地 Flash 与 AXI/Aurora 后端尚未实现，不可据此执行实际烧写**。
+这版按照你提供的 `RFAM187_OnlineUpgrade_Full_V1` 的文件结构整理：文件平铺、步骤展开、中文注释。协议规则和已经验证的接收保护保留。硬件接口集中在 `upgrade_board.c`，A 用本地接口，B/C/D 用远端接口。
 
-```mermaid
-flowchart TD
-  M[MLC UDP F0/0008] --> U[upgrade_udp\nlwIP UDP 10001]
-  U --> P[upgrade_protocol\n大端编解码与长度检查]
-  P --> S[upgrade_session\n分帧 / 镜像缓存 / 累加和 / 状态机]
-  S --> R[upgrade_board\n目标路由 0x71—0x74]
-  R --> A[upgrade_local\nA 板本地 Flash 接口]
-  R --> B[upgrade_aurora\nB/C/D 远端升级接口]
-  B -. 待硬件接入 .-> AX[AXI 控制与共享缓冲 → FIFO / Aurora]
-  AX -.-> REM[远端接收校验 → Flash 烧写 → 结果回传]
-  A --> S
-  REM -.-> S
-  S --> OUT[F3/0088、0089、008A]
-  OUT --> M
-```
+**这是一套可测试的软件框架，还不能真实烧写 Flash。** 芯片手册和新增 AXI/Aurora 控制接口尚未接入；没有驱动时返回失败，不报告虚假成功。
 
-## 实现范围
+## 建议阅读顺序
 
-- 0008 长度 `31+载荷长度`；0088 为 29 字节，0089/008A 为 28 字节。所有多字节整数采用大端，不带应用报文 CRC。
-- 首帧只收 60 字节摘要；之后每帧载荷 1～1024 字节，序号从 1 开始；完整文件校验覆盖摘要偏移 4 到文件末尾。
-- 只使用 0088 分帧应答，不另发 0001；0089 在目标准备与检查成功后发送，008A 根据实际烧写状态发送。
-- 会话绑定发送端 IP/端口、UUID、模块、处理器、配置项、程序编号、总帧数；一次只升级一个目标，避免共享缓存和硬件命令交叉。
-- 非连续帧回复失败和本地最近帧序号；重复帧不重复追加。完成后的最近帧重传会重发结果，不重复烧写。
-- 出站报告有有界队列，发送失败保留并重试；队列压力过大时拒收新帧，不提前推进接收序号。
-- 远端升级分为准备和烧写两阶段。远端准备阶段应完成传输、校验和容量预留；FIFO 空、DMA 完成或发送完成均不能代表烧写成功。
-- 默认硬件后端返回失败，不写任何猜测的寄存器或地址。
+先看 [逐函数讲解](README_逐函数讲解.md)，然后按下面顺序打开源码：
 
-## 代码入口
+| 顺序 | 文件 | 先理解什么 |
+|---|---|---|
+| 1 | `src/main_sdk.c` | 网络怎么初始化，主循环每一圈做什么 |
+| 2 | `src/upgrade_config.h` | IP、端口、目标编号、缓冲区和超时配置 |
+| 3 | `src/upgrade_udp_sdk.c` | lwIP 怎么调用收包函数，怎么把应答发回去 |
+| 4 | `src/icd_upgrade.c` | 怎么从字节数组读出字段，怎么生成应答 |
+| 5 | `src/upgrade_app.c` | 第一帧、后续帧、校验、准备、烧写各怎么处理 |
+| 6 | `src/upgrade_board.c` | A/B/C/D 怎么选择硬件通路，以后在哪里补驱动 |
 
-| 文件 | 职责 |
-|---|---|
-| src/upgrade_protocol.c/h | 编解码、BCD 摘要、累加和 |
-| src/upgrade_session.c/h | 四目标会话状态机，纯 C、无 BSP 依赖 |
-| src/upgrade_udp.c/h | lwIP 接收、pbuf 链拷贝、应答队列发送 |
-| src/upgrade_board.c/h | 板级配置、目标路由、UTC 时钟接口 |
-| src/upgrade_backend.h | 本地和远端后端契约 |
-| src/upgrade_local.c | A 板 Flash 待实现接口 |
-| src/upgrade_aurora.c | B/C/D AXI/Aurora 待实现接口 |
-| docs/升级后端接口.md | 硬件接入、两阶段状态和缓存所有权 |
+对应 `.h` 文件说明了结构体字段及函数参数。原 SDK 的平台文件继续保留；`echo.c` 和 JTAG 源码作为原工程参考保留，但新的 `main_sdk.c` 只启动升级网络流程，不启动 XVC。
 
-`src/main.c` 已加入启动和轮询调用。MicroBlaze 的 `platform.c` 定时中断增加轻量时钟计数；`platform_mb.c` 的定时周期按 BSP 100 MHz 时钟计算为 250 ms，修正原来按 66 MHz 常数计算的 165 ms 周期。
+## 本版规则
 
-## 主机验证
+- UDP 本机端口 10001；MLC 源端口要求为 10000，应答发回该来源 IP/端口。
+- 多字节整数大端，不附加应用报文 CRC。0008 长度为 `31+载荷长度`；0088 为 29 字节；0089/008A 为 28 字节。
+- 首帧仅含 60 字节摘要，后续每帧 1～1024 字节。摘要偏移 4 起及整份程序内容逐字节累加；临时使用 64 位，超过 32 位时拒绝而不偷偷截断。
+- 一次升级一个目标，绑定发送端、UUID、模块、处理器、配置项、文件编号和总帧数。
+- 非连续帧回复失败并返回最近收到的帧号，不重复追加数据。结束后的最后帧重传可重发结果，不重复烧写。
+- 收齐文件后先检查本地镜像，再准备目标；目标容量/校验确认后回 0089，真正烧写的状态通过 008A 回传。
+- 等待接收和结果保留时间为 30 秒；准备及烧写阶段各限时 120 秒。使用毫秒时钟，不使用主循环次数判断超时。
+
+这些是沿用原实现的规则。参考压缩包中的“重复帧成功应答”“可选 AXI 寄存器布局”等内容没有直接变成新的协议或硬件事实。
+
+## 编译与测试
+
+在电脑上测试：
 
 ```sh
 make test
-make check-bsp BSP_INCLUDE=/path/to/RFAM_187_XVC_bsp/microblaze_0/include
 ```
 
-`make test` 启用 AddressSanitizer 和 UndefinedBehaviorSanitizer，覆盖正常升级、乱序/重传、目标隔离、校验/容量失败、后端错误、发送背压、超时及 10000 组畸形报文；另外验证所有未实现后端都不会返回成功。当前执行器不支持 LeakSanitizer，命令只关闭泄漏检测；地址与未定义行为检查保留。
+包含协议、收包状态机、四目标会话、后端失败与分发测试，并执行 10000 组畸形报文输入。启用 AddressSanitizer/UndefinedBehaviorSanitizer；执行器不支持 LeakSanitizer，所以仅关闭泄漏检查。
 
-`check-bsp` 使用上传的 lwIP 2.0.2/Xilinx BSP 真实头文件检查启用和禁用升级两条编译路径，测试 UUID 仅用于编译，不是实际配置。它是主机语法/API 检查，**不是 MicroBlaze 编译、链接、时序或上板测试**。
+使用完整 BSP 的头文件检查 SDK 接口：
 
-## SDK 集成与配置
+```sh
+make check-bsp BSP_INCLUDE=/你的路径/RFAM_187_XVC_bsp/microblaze_0/include
+```
 
-1. 将 `src/upgrade_*.c/h` 加入原 SDK 应用，并合入 main/platform 的改动；使用原有 BSP 和 MicroBlaze 工具链。此仓库的 Makefile 只负责主机测试。
-2. 在 `upgrade_board.h` 设置真实的 `UP_BOARD_UUID`、`UP_BOARD_MODULE`，核实每个目标的配置项及程序编号；B/C/D 映射默认未知而禁用，不借用 A 的编号。A 的默认映射来自协议附录，仍需与产品配置核实。
-3. 实现并验证本地 Flash / 远端 AXI/Aurora 后端，补充 UTC 时间源。当前没有 UTC 源时报告时间戳为零；报告流水号采用本机递增 1～65535 的实现约定。
-4. 核对 `UP_BOARD_IMAGE_CAPACITY`（默认 32 MiB）及链接 map，确保专用 BSS 缓冲位于 DDR 且不与共享区、DMA 或其他使用者冲突。它不等于已确认的 Flash 容量。AXI 硬件使用前需要处理地址对齐、缓存一致性与所有权。
-5. 设置 `UP_BOARD_ENABLED=1`。默认关闭以避免使用未知 UUID/MARK。开启后 main 使用 `172.16.10.157/24`、网关 0（同网段），不启动 DHCP；保留 BSP 内 DHCP 支持。MLC 源端口要求为 10000，报告发回实际来源 IP 的该端口。网段/网关可在板级配置中调整。
-6. 当前 XVC 代码保留；升级测试期间不应并行运行 XVC 编程。接收回调只处理数据，耗时硬件步骤必须每次及时返回，让 lwIP 主循环继续运行。
+这只是主机上的语法/API 检查，不是 MicroBlaze 交叉编译或上板测试。测试中的 UUID 只是测试值，不能据此确认本机实际编号。
 
-## 当前采用的实现策略
+## 放入 SDK 时怎么做
 
-以下是补充实现策略，不宣称 ICD 已明确规定：接收/终态保留超时 30 秒；准备和烧写各限时 120 秒；未知/未启用目标或无法可靠解码的报文直接丢弃；只有完整可解析的升级消息参与 0088 应答。硬件未实现等未定义故障返回 0089 失败、保留故障码 0；没有虚构新错误码。
+1. **用 `main_sdk.c` 替换旧 `main.c`，工程只能有一个 `main()`。** `tests/` 不能编入 SDK 应用。
+2. 加入 `icd_upgrade.c`、`upgrade_app.c`、`upgrade_board.c`、`upgrade_udp_sdk.c` 及相应头文件和 `upgrade_config.h`。
+3. 从上一版迁移时，移除旧 `upgrade_protocol.*`、`upgrade_session.*`、`upgrade_udp.*`、`upgrade_local.c`、`upgrade_aurora.c`、`upgrade_backend.h`；本版已更名或合并，不能两套一起编。
+4. 保留配套 BSP 和平台代码；本仓库已在 `platform.c` 加入毫秒计数，在 `platform_mb.c` 按实际 100 MHz 时钟计算 250 ms 定时周期。
+5. 在 `upgrade_config.h` 填真实 UUID、模块 MARK 和各目标的配置项/程序编号，再将 `UP_BOARD_ENABLED` 设为 1。默认 0，服务不启用。B/C/D 编号未知时保持禁用。
+6. `main_sdk.c` 使用静态 `172.16.10.157/24`、网关 0，不启动 DHCP，即使 BSP 编译了 DHCP 支持。MAC 沿用原 SDK，现场若分配了不同 MAC/IP/网关，应相应修改。
+7. 默认暂存数组 32 MiB，位于链接器分配的 DDR BSS。上板必须检查 map、堆栈、DMA 和共享区，不能仅凭 DDR 总容量判断不冲突。
+8. 后端需要完成真实容量检查、传输、擦写、读回验证和取消操作；报文 UTC 时钟暂填零，后续也在板级文件接入。框架不自动重启或重配置 FPGA。
 
-32 位整文件校验字使用 64 位临时变量求精确字节和，超过 `UINT32_MAX` 视为校验失败，尚未擅自采用模 2^32 截断。该行为需在大镜像联调时与 MLC 确认。摘要采用有效 BCD 日期，文件长度不能为零。
-
-当前先把完整文件接收到 A 板 DDR，再执行目标准备；不是跨 UDP/Aurora 的逐帧实时转发。此策略适用于现有 512 MiB DDR，但镜像必须不超过配置的暂存上限。跨掉电恢复、双镜像回滚、自动复位/重配置及固件签名不是本版已经实现的功能。
-
-Flash 芯片手册与分区定义后续补充。架构说明中的硬件接口不等于已实现的驱动。
+[硬件后端接口说明](docs/升级后端接口.md) 记录了已核对的 BSP/BD 和仍需接入的硬件。现有 BD 为 Vivado 2018.3 / XC7VX690T，尚未包含图示新增升级控制、Aurora 和 Flash 控制模块；参考文件位于 `docs/bd-reference/` 和 `docs/bsp-reference/`。

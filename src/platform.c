@@ -32,7 +32,7 @@
 #if __MICROBLAZE__ || __PPC__
 #include "arch/cc.h"
 #include "platform.h"
-#include "upgrade_udp.h"
+#include "upgrade_udp_sdk.h"
 #include "platform_config.h"
 #include "xil_cache.h"
 #include "xparameters.h"
@@ -64,7 +64,7 @@ timer_callback()
 #if LWIP_DHCP==1
     static int dhcp_timer = 0;
 #endif
-    upgrade_udp_tick_250ms();
+    upgrade_udp_sdk_tick_250ms();
 	 TcpFastTmrFlag = 1;
 
 	odd = !odd;

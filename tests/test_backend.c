@@ -4,7 +4,7 @@
 int main(void) {
     unsigned target;
     uint8_t fault, progress, image=0;
-    up_metadata meta={0};
+    icd_summary_t meta={0};
     for(target=0x71;target<=0x74;target++) {
         assert(upgrade_board_prepare((uint8_t)target,&meta,&image,1)<0);
         assert(upgrade_board_prepare_step((uint8_t)target,&fault)<0);
